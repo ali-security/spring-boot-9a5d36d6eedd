@@ -1,0 +1,177 @@
+name: Seal build (spring-boot-autoconfigure)
+
+# Upstream builds Spring Boot 2.3.x on Concourse (ci/pipeline.yml ->
+# ci/scripts/build-project.sh: ./gradlew build on the JDK 8 ci-image) and ships
+# no GitHub Actions workflow that builds or tests. This workflow mirrors that
+# build for the spring-boot-autoconfigure module only: JDK 8, the project's own
+# Gradle 6.7.1 wrapper, the module's jar and its full test suite.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated test class/method patterns passed to --tests (empty = full suite)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: Build and test spring-boot-autoconfigure (JDK 8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Check the Docker engine accepts the Testcontainers 1.15 API version
+        # Testcontainers 1.15.0 (docker-java) speaks API v1.32. Only when the
+        # engine's minimum API is newer (Docker 29+) is the daemon reconfigured;
+        # otherwise it is left untouched.
+        run: |
+          docker version
+          if ! curl -fsS --unix-socket /var/run/docker.sock http://localhost/v1.32/version; then
+            sudo mkdir -p /etc/systemd/system/docker.service.d
+            printf '[Service]\nEnvironment=DOCKER_MIN_API_VERSION=1.24\n' | sudo tee /etc/systemd/system/docker.service.d/seal-min-api.conf
+            sudo systemctl daemon-reload
+            sudo systemctl restart docker
+            sleep 5
+            curl -fsS --unix-socket /var/run/docker.sock http://localhost/v1.32/version
+          fi
+          echo
+          docker info --format '{{.ServerVersion}} {{.Driver}} {{.CgroupVersion}}'
+
+      - name: Point the build at repositories that still serve anonymously
+        # repo.spring.io now requires authentication (HTTP 401). Drop the
+        # plugins-release repository and the io.spring.ge.conventions plugin
+        # (only published there, it configures ge.spring.io scans/remote cache),
+        # and fetch grolifant (needed by asciidoctor-gradle-jvm in buildSrc)
+        # from repo.gradle.org instead of repo.spring.io/release.
+        run: |
+          perl -0pi -e "s/\s*maven \{\s*url 'https:\/\/repo\.spring\.io\/plugins-release'\s*\}//" settings.gradle
+          perl -ni -e 'print unless /id "io\.spring\.ge\.conventions"/' settings.gradle
+          perl -pi -e 's#maven \{ url "https://repo\.spring\.io/release" \}#maven { url "https://repo.gradle.org/gradle/libs-releases"; content { includeGroup "org.ysb33r.gradle" } }#' buildSrc/build.gradle
+          sed -n 1,30p settings.gradle
+          grep -n "repo\." buildSrc/build.gradle
+
+      - name: Install test result reporter
+        run: |
+          cat > "$RUNNER_TEMP/seal-test-results.gradle" <<'EOF'
+          def sealSkipReason = { p, desc, result ->
+              def ex = result.exception
+              if (ex != null && ex.message) {
+                  return "assumption failed: " + ex.message
+              }
+              String cn = desc.className
+              int d = cn.indexOf('$')
+              if (d >= 0) {
+                  cn = cn.substring(0, d)
+              }
+              def f = p.file("src/test/java/" + cn.replace('.', '/') + ".java")
+              if (!f.exists()) {
+                  return "skipped by JUnit (source not found)"
+              }
+              def lines = f.readLines()
+              String m = desc.name
+              int paren = m.indexOf('(')
+              if (paren >= 0) {
+                  m = m.substring(0, paren)
+              }
+              def pat = java.util.regex.Pattern.compile('\\bvoid\\s+' + java.util.regex.Pattern.quote(m) + '\\s*\\(')
+              int idx = lines.findIndexOf { pat.matcher(it).find() }
+              def found = []
+              if (idx >= 0) {
+                  for (int i = idx - 1; i >= 0 && i >= idx - 10; i--) {
+                      String l = lines[i].trim()
+                      if (l.startsWith('@Disabled') || l.startsWith('@Enabled')) {
+                          found << l
+                      }
+                      else if (l.isEmpty() || l.startsWith('}') || l.endsWith(';')) {
+                          break
+                      }
+                  }
+              }
+              if (found.isEmpty()) {
+                  found = lines.findAll { it.trim().startsWith('@Disabled') || it.trim().startsWith('@Enabled') || it.contains('disabledWithoutDocker') }.collect { it.trim() }
+              }
+              if (found.isEmpty()) {
+                  return "skipped by JUnit (no annotation found in source)"
+              }
+              return "upstream source annotation " + found.join(' ') + (found.any { it == '@Disabled' } ? " (upstream disabled this test without a message)" : "")
+          }
+          allprojects {
+              tasks.withType(Test).configureEach { t ->
+                  t.outputs.upToDateWhen { false }
+                  t.outputs.cacheIf { false }
+                  t.testLogging {
+                      events "failed"
+                      exceptionFormat "full"
+                  }
+                  t.onOutput { desc, ev ->
+                      if (ev.message.contains('valid Docker environment') || ev.message.contains('DockerClientProviderStrategy') || ev.message.contains('Connected to docker')) {
+                          print "TESTCONTAINERS: " + ev.message
+                      }
+                  }
+                  t.afterTest { desc, result ->
+                      if (result.resultType == TestResult.ResultType.SKIPPED) {
+                          println "SKIPPED TEST: ${desc.className}#${desc.name} (${t.path}) -- reason: ${sealSkipReason(t.project, desc, result)}"
+                      }
+                      else if (result.resultType == TestResult.ResultType.FAILURE) {
+                          println "FAILED TEST: ${desc.className}#${desc.name} (${t.path})"
+                      }
+                  }
+                  t.afterSuite { desc, result ->
+                      if (desc.parent == null) {
+                          println "TEST SUMMARY ${t.path}: Tests: ${result.testCount}, passed: ${result.successfulTestCount}, failed: ${result.failedTestCount}, skipped: ${result.skippedTestCount}, result: ${result.resultType}"
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Build jar
+        run: |
+          ./gradlew -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false --no-daemon --max-workers=4 --console=plain --stacktrace --no-scan \
+            :spring-boot-project:spring-boot-autoconfigure:jar
+
+      - name: Test
+        run: |
+          F="${{ inputs.test-filter }}"
+          FILTER_ARGS=""
+          for t in $F; do
+            FILTER_ARGS="$FILTER_ARGS --tests $t"
+          done
+          ./gradlew -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false --no-daemon --max-workers=4 --console=plain --stacktrace --no-scan \
+            -I "$RUNNER_TEMP/seal-test-results.gradle" \
+            :spring-boot-project:spring-boot-autoconfigure:test $FILTER_ARGS
+
+      - name: Test results summary
+        if: ${{ !cancelled() }}
+        run: |
+          python3 - <<'EOF'
+          import glob, xml.etree.ElementTree as ET
+          files = glob.glob("spring-boot-project/spring-boot-autoconfigure/build/test-results/test/*.xml")
+          total = failed = errors = skipped = 0
+          per_class = {}
+          for f in files:
+              root = ET.parse(f).getroot()
+              t = int(root.get("tests", 0)); fl = int(root.get("failures", 0)); e = int(root.get("errors", 0)); s = int(root.get("skipped", 0))
+              total += t; failed += fl; errors += e; skipped += s
+              per_class[root.get("name")] = (t, fl + e, s)
+          print(f"spring-boot-autoconfigure test results: Tests: {total}, passed: {total - failed - errors - skipped}, failed: {failed + errors}, skipped: {skipped} ({len(files)} classes)")
+          for name, (t, fe, s) in sorted(per_class.items()):
+              if ".web.servlet.WebMvc" in name or ".web.servlet.WelcomePage" in name:
+                  print(f"patched-path class {name}: tests: {t}, failed: {fe}, skipped: {s}")
+          EOF
+
+      - name: Upload jar
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-boot-autoconfigure-jar
+          path: spring-boot-project/spring-boot-autoconfigure/build/libs/spring-boot-autoconfigure-2.3.8.RELEASE.jar
+          if-no-files-found: error
